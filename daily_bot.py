@@ -3,302 +3,430 @@ import requests
 import os
 import logging
 import time
+import re
 from datetime import datetime, timedelta
+from typing import List, Dict, Optional, Tuple
 
 # Configuration
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHANNEL_ID = os.getenv('TELEGRAM_CHANNEL_ID')
 RSS_URL = 'https://news.smol.ai/rss.xml'
 
-logging.basicConfig(level=logging.INFO)
+# Telegram limits
+TELEGRAM_MAX_LENGTH = 4096
+TELEGRAM_MAX_CAPTION_LENGTH = 1024
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-def send_telegram_message(message: str) -> bool:
-    """Send message to Telegram channel"""
+
+def escape_markdown_v2(text: str) -> str:
+    """Escape special characters for Telegram MarkdownV2"""
+    # List of characters that need escaping in MarkdownV2
+    escape_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    
+    for char in escape_chars:
+        text = text.replace(char, f'\\{char}')
+    
+    return text
+
+
+def send_telegram_message(message: str, parse_mode: str = 'MarkdownV2') -> bool:
+    """Send message to Telegram channel with retry logic"""
     url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage'
     
-    # Split long messages if needed
-    if len(message) > 4000:
-        message = message[:4000] + "... (truncated)"
+    # Ensure message doesn't exceed Telegram's limit
+    if len(message) > TELEGRAM_MAX_LENGTH:
+        message = message[:TELEGRAM_MAX_LENGTH - 20] + '\n\n\\.\\.\\.truncated'
     
     data = {
         'chat_id': TELEGRAM_CHANNEL_ID,
         'text': message,
-        'parse_mode': 'Markdown',
+        'parse_mode': parse_mode,
         'disable_web_page_preview': False
     }
     
-    try:
-        response = requests.post(url, data=data, timeout=30)
-        logger.info(f"Response status: {response.status_code}")
-        response.raise_for_status()
-        return True
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to send message: {e}")
-        logger.error(f"Response content: {response.text if 'response' in locals() else 'No response'}")
-        return False
-
-def is_recent_post(entry, hours=25):
-    """Check if post is from the last 25 hours (buffer for daily runs)"""
-    try:
-        import email.utils
-        # Try parsing the published date
-        published_str = entry.get('published', '')
-        if published_str:
-            # Parse RFC 2822 format (common in RSS)
-            time_tuple = email.utils.parsedate_tz(published_str)
-            if time_tuple:
-                import calendar
-                published_timestamp = calendar.timegm(time_tuple[:9])
-                if time_tuple[9]:
-                    published_timestamp -= time_tuple[9]  # Adjust for timezone
+    # Retry logic
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(url, data=data, timeout=30)
+            
+            if response.status_code == 200:
+                logger.info("Message sent successfully")
+                return True
+            else:
+                logger.error(f"API error: {response.status_code} - {response.text}")
                 
-                cutoff_timestamp = datetime.now().timestamp() - (hours * 3600)
-                return published_timestamp > cutoff_timestamp
-    except Exception as e:
-        logger.debug(f"Date parsing error: {e}")
+                # If it's a parse error, try with plain text
+                if "can't parse" in response.text.lower() and parse_mode != 'HTML':
+                    logger.info("Retrying with plain text due to parse error")
+                    data['parse_mode'] = None
+                    continue
+                    
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request failed (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # Exponential backoff
+                
+    return False
+
+
+def parse_rss_date(date_str: str) -> Optional[datetime]:
+    """Parse various RSS date formats"""
+    import email.utils
+    from dateutil import parser as date_parser
     
-    # If we can't parse date, assume it's recent (better to send than miss)
+    try:
+        # Try RFC 2822 format first (common in RSS)
+        time_tuple = email.utils.parsedate_tz(date_str)
+        if time_tuple:
+            import calendar
+            timestamp = calendar.timegm(time_tuple[:9])
+            if time_tuple[9]:
+                timestamp -= time_tuple[9]  # Adjust for timezone
+            return datetime.fromtimestamp(timestamp)
+    except Exception:
+        pass
+    
+    try:
+        # Fallback to dateutil parser
+        return date_parser.parse(date_str)
+    except Exception:
+        logger.debug(f"Could not parse date: {date_str}")
+        return None
+
+
+def is_recent_post(entry: dict, hours: int = 25) -> bool:
+    """Check if post is from the last N hours"""
+    published_str = entry.get('published', entry.get('updated', ''))
+    
+    if not published_str:
+        # If no date, assume it's recent
+        return True
+    
+    published_date = parse_rss_date(published_str)
+    if published_date:
+        cutoff_date = datetime.now() - timedelta(hours=hours)
+        return published_date > cutoff_date
+    
+    # If we can't parse date, assume it's recent
     return True
 
-def extract_links_from_text(text: str) -> list:
-    """Extract URLs from text"""
-    import re
-    # Pattern to match URLs
-    url_pattern = r'https?://[^\s\)]+(?=\s|\)|$|,|\.)'
-    links = re.findall(url_pattern, text)
-    return links
 
-def extract_top_news_items(content: str, max_items: int = 5) -> list:
-    """Extract top news items from the post content"""
-    import re
+def clean_html(text: str) -> str:
+    """Remove HTML tags and decode entities"""
+    import html
     
     # Remove HTML tags
-    content = re.sub(r'<[^>]+>', '', content)
+    text = re.sub(r'<[^>]+>', '', text)
     
+    # Decode HTML entities
+    text = html.unescape(text)
+    
+    # Clean up extra whitespace
+    text = re.sub(r'\s+', ' ', text)
+    
+    return text.strip()
+
+
+def extract_url_from_text(text: str) -> Optional[str]:
+    """Extract the first URL from text"""
+    url_pattern = r'https?://[^\s\)<>\[\]]+(?:[^\s\)<>\[\]]*[^\s\)<>\[\].,;:!?\'"»])?'
+    match = re.search(url_pattern, text)
+    return match.group(0) if match else None
+
+
+def extract_news_items(content: str, max_items: int = 5) -> List[Dict[str, str]]:
+    """Extract news items with improved pattern matching"""
+    content = clean_html(content)
     news_items = []
-    content_lines = content.split('\n')
     
-    # Look for bullet points and numbered lists
-    for line in content_lines:
-        line = line.strip()
-        if not line:
-            continue
-            
-        # Skip very short lines
-        if len(line) < 30:
-            continue
-            
-        # Look for lines that start with bullets, numbers, or company names
-        if (re.match(r'^[-*•]\s*', line) or 
-            re.match(r'^\d+\.\s*', line) or
-            re.match(r'^[A-Z][a-zA-Z0-9&\s]{2,20}(?:\s(?:announced|released|launched|introduced|updated))', line) or
-            any(keyword in line.lower() for keyword in ['announced', 'released', 'launched', 'introduced', 'updated', 'acquired', 'secured', 'published', 'reached', 'achieved'])):
-            
-            # Clean up the line
-            clean_line = re.sub(r'^[-*•]\s*', '', line)
-            clean_line = re.sub(r'^\d+\.\s*', '', clean_line)
-            clean_line = clean_line.strip()
-            
-            if len(clean_line) > 30 and clean_line not in [item['text'] for item in news_items]:
-                news_items.append({
-                    'text': clean_line,
-                    'links': extract_links_from_text(clean_line)
-                })
-                
-        # Also look for lines that mention key AI companies/models
-        elif any(keyword in line.lower() for keyword in ['openai', 'anthropic', 'google', 'microsoft', 'meta', 'tesla', 'nvidia', 'chatgpt', 'claude', 'gemini', 'grok', 'llama']):
-            if len(line) > 30 and line not in [item['text'] for item in news_items]:
-                news_items.append({
-                    'text': line,
-                    'links': extract_links_from_text(line)
-                })
+    # Split by common delimiters
+    lines = re.split(r'\n|(?<=[.!?])\s+(?=[A-Z])', content)
     
-    # Sort by length (longer items are usually more informative) and return top items
-    news_items.sort(key=lambda x: len(x['text']), reverse=True)
-    return news_items[:max_items]
-
-def format_news_items(news_items: list, post_title: str, post_link: str) -> str:
-    """Format extracted news items for Telegram with aggressive truncation"""
-    
-    # Escape title
-    title = post_title.replace('*', '\\*').replace('_', '\\_').replace('[', '\\[').replace('`', '\\`')
-    
-    # Start building the message
-    header = f"🤖 *{title}*\n\n"
-    footer = f"\n📄 [Read full post]({post_link})"
-    
-    if not news_items:
-        content = "📰 Check out today's AI news roundup!"
-        return header + content + footer
-    
-    # Build news items section with aggressive truncation
-    content = f"📰 *Top AI News:*\n\n"
-    
-    for i, item in enumerate(news_items[:5]):  # Max 5 items since they're much shorter now
-        # Extract key info aggressively
-        text = item['text']
-        
-        # Remove markdown escaping for processing, will re-add later
-        text = text.replace('\\*', '*').replace('\\_', '_').replace('\\[', '[').replace('\\`', '`')
-        
-        # Try to extract the most important part (company + action + product)
-        punchy_summary = extract_punchy_summary(text)
-        
-        # Re-escape for Telegram
-        punchy_summary = punchy_summary.replace('*', '\\*').replace('_', '\\_').replace('[', '\\[').replace('`', '\\`')
-        
-        # Format item (very compact)
-        content += f"*{i+1}.* {punchy_summary}\n"
-        
-        # Add one link if available (very compact format)
-        if item['links']:
-            content += f"   🔗 [Link]({item['links'][0]})\n"
-        
-        content += "\n"
-    
-    return header + content + footer
-
-def extract_punchy_summary(text: str) -> str:
-    """Extract a punchy 50-80 character summary from news text"""
-    import re
-    
-    # Remove extra whitespace and clean up
-    text = ' '.join(text.split())
-    
-    # Look for key patterns: Company + Action + Product
-    company_action_patterns = [
-        r'([A-Z][a-zA-Z]+)\s+(announced|released|launched|introduced|updated|acquired|secured|published|reached|achieved|unveiled|debuted)\s+([^,\.]{1,30})',
-        r'([A-Z][a-zA-Z]+)\s+([a-z]+ed|is|has|will)\s+([^,\.]{1,30})',
-        r'([A-Z][a-zA-Z0-9]+(?:-[A-Z0-9]+)*)\s+(.*?)(?:,|\.|\s-\s)',
+    # Keywords that indicate news
+    action_keywords = [
+        'announced', 'released', 'launched', 'introduced', 'unveiled',
+        'debuted', 'published', 'acquired', 'raised', 'secured',
+        'partnered', 'collaborated', 'achieved', 'reached', 'surpassed',
+        'developed', 'created', 'built', 'deployed', 'updated'
     ]
     
-    for pattern in company_action_patterns:
-        match = re.search(pattern, text)
+    # Company/product patterns
+    company_pattern = r'\b(?:' + '|'.join([
+        'OpenAI', 'Anthropic', 'Google', 'Microsoft', 'Meta', 'Apple',
+        'Amazon', 'NVIDIA', 'Tesla', 'DeepMind', 'Stability AI',
+        'Hugging Face', 'Mistral', 'Cohere', 'Inflection', 'Character\.AI',
+        'Midjourney', 'RunwayML', 'Perplexity', 'Claude', 'ChatGPT',
+        'GPT-\d+', 'Gemini', 'LLaMA', 'DALL-E', 'Copilot', 'Bard'
+    ]) + r')\b'
+    
+    seen_items = set()
+    
+    for line in lines:
+        line = line.strip()
+        
+        # Skip short lines or duplicates
+        if len(line) < 30 or line in seen_items:
+            continue
+        
+        # Check if line contains relevant keywords
+        line_lower = line.lower()
+        has_action = any(keyword in line_lower for keyword in action_keywords)
+        has_company = re.search(company_pattern, line, re.IGNORECASE)
+        
+        # Score the line
+        score = 0
+        if has_action:
+            score += 2
+        if has_company:
+            score += 2
+        if re.match(r'^[-•*]\s*', line):  # Bullet point
+            score += 1
+        if re.match(r'^\d+\.\s*', line):  # Numbered list
+            score += 1
+        
+        if score >= 2:  # Threshold for inclusion
+            # Clean the line
+            clean_line = re.sub(r'^[-•*]\s*', '', line)
+            clean_line = re.sub(r'^\d+\.\s*', '', clean_line)
+            
+            # Extract URL if present
+            url = extract_url_from_text(clean_line)
+            
+            news_items.append({
+                'text': clean_line,
+                'url': url,
+                'score': score
+            })
+            seen_items.add(line)
+    
+    # Sort by score and return top items
+    news_items.sort(key=lambda x: x['score'], reverse=True)
+    return news_items[:max_items]
+
+
+def create_punchy_summary(text: str, max_length: int = 80) -> str:
+    """Create a concise summary of news item"""
+    # Try to extract key components
+    patterns = [
+        # Company + action + product/detail
+        r'([A-Z][a-zA-Z\s&]+?)\s+(announced|released|launched|introduced|unveiled|acquired|raised|secured)\s+(.{10,50})',
+        # Model/Product name pattern
+        r'([A-Z][a-zA-Z0-9\s-]+?)\s+(is|are|was|were|has|have)\s+(.{10,50})',
+        # Achievement pattern
+        r'(.{10,30})\s+(reached|achieved|surpassed|hit)\s+(.{10,30})',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
         if match:
-            if len(match.groups()) >= 3:
-                company, action, product = match.groups()[:3]
-                summary = f"{company} {action} {product}".strip()
-            else:
-                summary = match.group(0).strip()
-            
-            # Clean up and truncate
-            summary = re.sub(r'\s+', ' ', summary)
-            if len(summary) <= 80:
+            summary = ' '.join(match.groups())
+            if len(summary) <= max_length:
                 return summary
-            
-    # Fallback: Take first sentence or first 80 chars
-    sentences = re.split(r'[.!?]', text)
-    first_sentence = sentences[0].strip()
     
-    if len(first_sentence) <= 80:
-        return first_sentence
-    
-    # Last resort: hard truncate at word boundary
-    if len(text) <= 80:
+    # Fallback: smart truncation
+    if len(text) <= max_length:
         return text
     
-    # Find last space before 75 chars to leave room for "..."
-    truncated = text[:75]
-    last_space = truncated.rfind(' ')
-    if last_space > 50:  # Ensure we don't truncate too aggressively
-        return text[:last_space] + "..."
-    else:
-        return text[:75] + "..."
+    # Try to break at sentence boundary
+    sentences = re.split(r'[.!?]', text)
+    if sentences and len(sentences[0]) <= max_length:
+        return sentences[0].strip()
+    
+    # Last resort: truncate at word boundary
+    words = text.split()
+    summary = ""
+    for word in words:
+        if len(summary) + len(word) + 1 <= max_length - 3:
+            summary += word + " "
+        else:
+            break
+    
+    return summary.strip() + "..."
 
-def format_simple_post(entry) -> str:
-    """Simple fallback format for posts"""
+
+def format_telegram_message(entry: dict, news_items: List[Dict[str, str]]) -> str:
+    """Format message for Telegram with MarkdownV2"""
     title = entry.get('title', 'AI News Update')
     link = entry.get('link', '')
-    summary = entry.get('summary', entry.get('description', ''))
     
-    # Clean up summary
-    if summary:
-        import re
-        summary = re.sub(r'<[^>]+>', '', summary)
-        if len(summary) > 200:
-            summary = summary[:200] + "..."
-        # Escape markdown
-        summary = summary.replace('*', '\\*').replace('_', '\\_').replace('[', '\\[').replace('`', '\\`')
+    # Build message parts
+    parts = []
     
-    # Escape title
-    title = title.replace('*', '\\*').replace('_', '\\_').replace('[', '\\[').replace('`', '\\`')
+    # Header with emoji and title
+    escaped_title = escape_markdown_v2(title)
+    parts.append(f"🤖 *{escaped_title}*")
+    parts.append("")  # Empty line
     
-    message = f"🤖 *{title}*\n\n"
+    if news_items:
+        parts.append("📰 *Top AI News:*")
+        parts.append("")
+        
+        for i, item in enumerate(news_items[:5], 1):
+            summary = create_punchy_summary(item['text'])
+            escaped_summary = escape_markdown_v2(summary)
+            
+            # Add numbered item
+            parts.append(f"{i}\\. {escaped_summary}")
+            
+            # Add link if available
+            if item.get('url'):
+                escaped_url = escape_markdown_v2(item['url'])
+                parts.append(f"   🔗 [Link]({escaped_url})")
+            
+            parts.append("")  # Empty line between items
+    else:
+        # Fallback content
+        summary = entry.get('summary', entry.get('description', ''))
+        if summary:
+            summary = clean_html(summary)
+            if len(summary) > 200:
+                summary = summary[:197] + "..."
+            escaped_summary = escape_markdown_v2(summary)
+            parts.append(escaped_summary)
+            parts.append("")
     
-    if summary:
-        message += f"{summary}\n\n"
-    
+    # Footer with read more link
     if link:
-        message += f"🔗 [Read full article]({link})"
+        escaped_link = escape_markdown_v2(link)
+        parts.append(f"📄 [Read full post]({escaped_link})")
+    
+    # Join all parts
+    message = '\n'.join(parts)
+    
+    # Final length check
+    if len(message) > TELEGRAM_MAX_LENGTH - 100:
+        # If still too long, remove some news items
+        return format_telegram_message(entry, news_items[:3])
     
     return message
 
+
+def test_message_format(message: str) -> bool:
+    """Test if message format is valid"""
+    # Check for common formatting issues
+    issues = []
+    
+    # Check unescaped characters
+    unescaped_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    for char in unescaped_chars:
+        if re.search(f'(?<!\\\\){re.escape(char)}', message):
+            # Check if it's part of a valid markdown construct
+            if not (char in ['*', '_'] and re.search(f'(?<!\\\\){re.escape(char)}[^{re.escape(char)}]+(?<!\\\\){re.escape(char)}', message)):
+                issues.append(f"Unescaped {char}")
+    
+    # Check balanced markdown
+    for marker in ['*', '_', '`']:
+        escaped_marker = f'\\{marker}'
+        count = message.count(marker) - message.count(escaped_marker)
+        if count % 2 != 0:
+            issues.append(f"Unbalanced {marker}")
+    
+    if issues:
+        logger.warning(f"Message format issues: {', '.join(issues)}")
+        return False
+    
+    return True
+
+
 def main():
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
-        logger.error("Missing required environment variables")
+    """Main function with improved error handling"""
+    # Validate environment variables
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN not set")
+        return
+    
+    if not TELEGRAM_CHANNEL_ID:
+        logger.error("TELEGRAM_CHANNEL_ID not set")
         return
     
     try:
         logger.info(f"Fetching RSS feed from {RSS_URL}")
         feed = feedparser.parse(RSS_URL)
         
+        # Check for feed errors
+        if feed.bozo:
+            logger.warning(f"Feed parsing issues: {feed.bozo_exception}")
+        
         if not feed.entries:
-            logger.warning("No entries found in RSS feed")
+            logger.error("No entries found in RSS feed")
+            send_telegram_message(
+                "⚠️ No posts found in AI news feed\\. Check [news\\.smol\\.ai](https://news.smol.ai) directly\\.",
+                parse_mode='MarkdownV2'
+            )
             return
         
-        # Get recent posts (last 25 hours)
-        recent_posts = [entry for entry in feed.entries if is_recent_post(entry)]
+        # Get recent posts
+        recent_posts = [entry for entry in feed.entries if is_recent_post(entry, hours=25)]
         
         if not recent_posts:
-            # If no recent posts, send the latest post anyway
-            recent_posts = [feed.entries[0]] if feed.entries else []
-            logger.info("No posts from last 25h, sending latest post")
+            # Send the latest post if no recent ones
+            recent_posts = [feed.entries[0]]
+            logger.info("No recent posts found, using latest post")
         
-        logger.info(f"Found {len(recent_posts)} recent posts")
+        logger.info(f"Processing {len(recent_posts)} post(s)")
         
-        # Send all content in ONE message per post
-        for i, post in enumerate(recent_posts[:1]):  # Limit to 1 most recent post to avoid spam
+        # Process posts (limit to avoid spam)
+        for i, post in enumerate(recent_posts[:2]):
             try:
                 title = post.get('title', 'AI News Update')
-                link = post.get('link', '')
                 content = post.get('summary', post.get('description', ''))
                 
-                logger.info(f"Processing post: {title}")
+                logger.info(f"Processing: {title}")
                 
-                # Try to extract news items
-                news_items = extract_top_news_items(content, max_items=4)
+                # Extract news items
+                news_items = extract_news_items(content, max_items=5)
+                logger.info(f"Extracted {len(news_items)} news items")
                 
-                if news_items:
-                    message = format_news_items(news_items, title, link)
-                    logger.info(f"Extracted {len(news_items)} news items")
+                # Format message
+                message = format_telegram_message(post, news_items)
+                
+                # Test message format
+                if not test_message_format(message):
+                    logger.warning("Message format issues detected, sending with HTML instead")
+                    # Convert to HTML as fallback
+                    message = message.replace('\\', '')
+                    message = message.replace('*', '<b>').replace('*', '</b>')
+                    message = message.replace('_', '<i>').replace('_', '</i>')
+                    if send_telegram_message(message, parse_mode='HTML'):
+                        logger.info("Message sent successfully with HTML")
+                    else:
+                        # Last resort: plain text
+                        plain_message = clean_html(message)
+                        send_telegram_message(plain_message, parse_mode=None)
                 else:
-                    # Fallback to simple format
-                    message = format_simple_post(post)
-                    logger.info("Using simple format (no items extracted)")
+                    # Send with MarkdownV2
+                    if send_telegram_message(message):
+                        logger.info("Message sent successfully")
+                    else:
+                        logger.error("Failed to send message")
                 
-                # Log message length for debugging
-                logger.info(f"Message length: {len(message)} characters")
-                
-                # Send the single comprehensive message
-                if send_telegram_message(message):
-                    logger.info(f"Successfully sent comprehensive update")
-                else:
-                    logger.error(f"Failed to send update")
+                # Rate limiting between messages
+                if i < len(recent_posts) - 1:
+                    time.sleep(2)
                     
             except Exception as e:
-                logger.error(f"Error processing post: {e}")
-                # Send a simple error message
-                error_message = f"⚠️ Error processing today's AI news. Please check [news.smol.ai](https://news.smol.ai) directly."
-                send_telegram_message(error_message)
+                logger.error(f"Error processing post '{title}': {e}", exc_info=True)
+                # Send error notification
+                error_msg = f"⚠️ Error processing post: {escape_markdown_v2(str(e)[:100])}"
+                send_telegram_message(error_msg, parse_mode='MarkdownV2')
         
-        logger.info("Daily update completed!")
+        logger.info("Daily update completed successfully!")
         
     except Exception as e:
-        logger.error(f"Error: {e}")
-        # Send error notification to channel
-        error_msg = f"⚠️ Daily AI news bot encountered an error: {str(e)}"
-        send_telegram_message(error_msg)
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        # Try to send error notification
+        try:
+            error_msg = f"⚠️ Bot error: {escape_markdown_v2(str(e)[:200])}"
+            send_telegram_message(error_msg, parse_mode='MarkdownV2')
+        except:
+            pass
+
 
 if __name__ == "__main__":
     main()
