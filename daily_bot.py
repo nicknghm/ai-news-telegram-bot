@@ -119,7 +119,7 @@ def extract_top_news_items(content: str, max_items: int = 5) -> list:
     return news_items[:max_items]
 
 def format_news_items(news_items: list, post_title: str, post_link: str) -> str:
-    """Format extracted news items for Telegram with smart truncation"""
+    """Format extracted news items for Telegram with aggressive truncation"""
     
     # Escape title
     title = post_title.replace('*', '\\*').replace('_', '\\_').replace('[', '\\[').replace('`', '\\`')
@@ -128,86 +128,83 @@ def format_news_items(news_items: list, post_title: str, post_link: str) -> str:
     header = f"🤖 *{title}*\n\n"
     footer = f"\n📄 [Read full post]({post_link})"
     
-    # Calculate available space for content
-    available_space = 3800 - len(header) - len(footer)  # Buffer for safety
-    
     if not news_items:
         content = "📰 Check out today's AI news roundup!"
         return header + content + footer
     
-    # Build news items section
-    news_header = f"📰 *Top AI News:*\n\n"
-    content = news_header
+    # Build news items section with aggressive truncation
+    content = f"📰 *Top AI News:*\n\n"
     
-    # Calculate space per item (rough estimate)
-    space_per_item = (available_space - len(news_header)) // min(len(news_items), 3)
-    
-    items_added = 0
-    for i, item in enumerate(news_items[:3]):  # Max 3 items
-        # Escape and clean text
+    for i, item in enumerate(news_items[:5]):  # Max 5 items since they're much shorter now
+        # Extract key info aggressively
         text = item['text']
-        text = text.replace('*', '\\*').replace('_', '\\_').replace('[', '\\[').replace('`', '\\`')
         
-        # Smart truncation: find good breaking point
-        max_text_length = min(space_per_item - 100, 120)  # Reserve space for formatting and links
+        # Remove markdown escaping for processing, will re-add later
+        text = text.replace('\\*', '*').replace('\\_', '_').replace('\\[', '[').replace('\\`', '`')
         
-        if len(text) > max_text_length:
-            # Try to break at sentence boundary
-            truncated = text[:max_text_length]
-            last_period = truncated.rfind('.')
-            last_comma = truncated.rfind(',')
-            last_space = truncated.rfind(' ')
-            
-            # Choose best break point
-            if last_period > max_text_length - 50:
-                text = text[:last_period + 1]
-            elif last_comma > max_text_length - 30:
-                text = text[:last_comma] + "..."
-            elif last_space > max_text_length - 20:
-                text = text[:last_space] + "..."
-            else:
-                text = text[:max_text_length - 3] + "..."
+        # Try to extract the most important part (company + action + product)
+        punchy_summary = extract_punchy_summary(text)
         
-        # Format item
-        item_text = f"*{i+1}.* {text}\n"
+        # Re-escape for Telegram
+        punchy_summary = punchy_summary.replace('*', '\\*').replace('_', '\\_').replace('[', '\\[').replace('`', '\\`')
         
-        # Add link if available
+        # Format item (very compact)
+        content += f"*{i+1}.* {punchy_summary}\n"
+        
+        # Add one link if available (very compact format)
         if item['links']:
-            item_text += f"   🔗 [Source]({item['links'][0]})\n"
+            content += f"   🔗 [Link]({item['links'][0]})\n"
         
-        item_text += "\n"
-        
-        # Check if adding this item would exceed our space
-        if len(content + item_text) > available_space:
-            if items_added == 0:  # Must include at least one item
-                # Truncate this item more aggressively
-                max_emergency_length = available_space - len(content) - 100
-                if max_emergency_length > 50:
-                    emergency_text = item['text'][:max_emergency_length] + "..."
-                    emergency_text = emergency_text.replace('*', '\\*').replace('_', '\\_').replace('[', '\\[').replace('`', '\\`')
-                    content += f"*1.* {emergency_text}\n\n"
-                    items_added = 1
-            break
-        
-        content += item_text
-        items_added += 1
+        content += "\n"
     
-    # Final message assembly
-    final_message = header + content + footer
+    return header + content + footer
+
+def extract_punchy_summary(text: str) -> str:
+    """Extract a punchy 50-80 character summary from news text"""
+    import re
     
-    # Final safety check - if still too long, do emergency truncation
-    if len(final_message) > 3900:
-        # Calculate how much to cut
-        excess = len(final_message) - 3900
-        # Cut from the content, not the header or footer
-        content_end = len(header + content)
-        footer_start = content_end
-        
-        # Truncate content before footer
-        safe_content = content[:-excess-20] + "...\n\n"
-        final_message = header + safe_content + footer
+    # Remove extra whitespace and clean up
+    text = ' '.join(text.split())
     
-    return final_message
+    # Look for key patterns: Company + Action + Product
+    company_action_patterns = [
+        r'([A-Z][a-zA-Z]+)\s+(announced|released|launched|introduced|updated|acquired|secured|published|reached|achieved|unveiled|debuted)\s+([^,\.]{1,30})',
+        r'([A-Z][a-zA-Z]+)\s+([a-z]+ed|is|has|will)\s+([^,\.]{1,30})',
+        r'([A-Z][a-zA-Z0-9]+(?:-[A-Z0-9]+)*)\s+(.*?)(?:,|\.|\s-\s)',
+    ]
+    
+    for pattern in company_action_patterns:
+        match = re.search(pattern, text)
+        if match:
+            if len(match.groups()) >= 3:
+                company, action, product = match.groups()[:3]
+                summary = f"{company} {action} {product}".strip()
+            else:
+                summary = match.group(0).strip()
+            
+            # Clean up and truncate
+            summary = re.sub(r'\s+', ' ', summary)
+            if len(summary) <= 80:
+                return summary
+            
+    # Fallback: Take first sentence or first 80 chars
+    sentences = re.split(r'[.!?]', text)
+    first_sentence = sentences[0].strip()
+    
+    if len(first_sentence) <= 80:
+        return first_sentence
+    
+    # Last resort: hard truncate at word boundary
+    if len(text) <= 80:
+        return text
+    
+    # Find last space before 75 chars to leave room for "..."
+    truncated = text[:75]
+    last_space = truncated.rfind(' ')
+    if last_space > 50:  # Ensure we don't truncate too aggressively
+        return text[:last_space] + "..."
+    else:
+        return text[:75] + "..."
 
 def format_simple_post(entry) -> str:
     """Simple fallback format for posts"""
