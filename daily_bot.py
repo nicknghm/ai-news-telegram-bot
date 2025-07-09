@@ -58,27 +58,95 @@ def is_recent_post(entry, hours=25):
     # If we can't parse date, assume it's recent (better to send than miss)
     return True
 
-def format_post(entry) -> str:
-    """Format RSS entry for Telegram"""
-    title = entry.get('title', 'No title')
-    link = entry.get('link', '')
-    summary = entry.get('summary', entry.get('description', ''))
+def extract_top_news_items(content: str, max_items: int = 5) -> list:
+    """Extract top news items from the post content"""
+    import re
     
-    # Clean up summary
-    if summary:
-        import re
-        summary = re.sub(r'<[^>]+>', '', summary)
-        if len(summary) > 300:
-            summary = summary[:300] + "..."
+    # Remove HTML tags
+    content = re.sub(r'<[^>]+>', '', content)
     
-    message = f"🤖 **{title}**\n\n"
+    # Look for news patterns - items that start with company names or key terms
+    news_patterns = [
+        r'(?:^|\n)([A-Z][A-Za-z0-9&\s]{2,30}(?:\s(?:announced|released|launched|introduced|updated|acquired|secured|published|reached|achieved|expanded|partnered|developed|created|unveiled|debuted|hired|filed|raised|reported|shared|posted|confirmed|revealed|showed|demonstrated|teased|previewed|broke|disclosed|leaked|sparked|gained|surpassed|topped|dominated|won|beat|outperformed|defeated|overtook|passed|exceeded|hit|crossed|reached|climbed|soared|jumped|skyrocketed|plummeted|dropped|fell|declined|crashed|tumbled|slumped|dipped|slid)).*?)(?=\n[A-Z]|\n-|\n\*|\n\d+\.|\n$|$)',
+        r'(?:^|\n)(.*?(?:AI|ML|LLM|GPU|API|model|dataset|algorithm|neural|transformer|chatgpt|claude|gemini|grok|llama|mistral|anthropic|openai|google|microsoft|meta|tesla|nvidia|amd|intel).*?)(?=\n[A-Z]|\n-|\n\*|\n\d+\.|\n$|$)',
+        r'(?:^|\n)- (.*?)(?=\n-|\n\*|\n\d+\.|\n[A-Z][a-z]|\n$|$)',
+        r'(?:^|\n)\* (.*?)(?=\n-|\n\*|\n\d+\.|\n[A-Z][a-z]|\n$|$)',
+        r'(?:^|\n)\d+\.\s*(.*?)(?=\n\d+\.|\n-|\n\*|\n[A-Z][a-z]|\n$|$)'
+    ]
     
-    if summary:
-        message += f"{summary}\n\n"
+    news_items = []
+    content_lines = content.split('\n')
     
-    if link:
-        message += f"🔗 [Read full article]({link})"
+    # Look for bullet points and numbered lists
+    for line in content_lines:
+        line = line.strip()
+        if not line:
+            continue
+            
+        # Skip very short lines
+        if len(line) < 20:
+            continue
+            
+        # Look for lines that start with bullets, numbers, or company names
+        if (re.match(r'^[-*•]\s*', line) or 
+            re.match(r'^\d+\.\s*', line) or
+            re.match(r'^[A-Z][a-zA-Z0-9&\s]{2,20}(?:\s(?:announced|released|launched|introduced|updated))', line) or
+            any(keyword in line.lower() for keyword in ['announced', 'released', 'launched', 'introduced', 'updated', 'acquired', 'secured', 'published', 'reached', 'achieved'])):
+            
+            # Clean up the line
+            clean_line = re.sub(r'^[-*•]\s*', '', line)
+            clean_line = re.sub(r'^\d+\.\s*', '', clean_line)
+            clean_line = clean_line.strip()
+            
+            if len(clean_line) > 30 and clean_line not in [item['text'] for item in news_items]:
+                news_items.append({
+                    'text': clean_line,
+                    'links': extract_links_from_text(clean_line)
+                })
+                
+        # Also look for lines that mention key AI companies/models
+        elif any(keyword in line.lower() for keyword in ['openai', 'anthropic', 'google', 'microsoft', 'meta', 'tesla', 'nvidia', 'chatgpt', 'claude', 'gemini', 'grok', 'llama']):
+            if len(line) > 30 and line not in [item['text'] for item in news_items]:
+                news_items.append({
+                    'text': line,
+                    'links': extract_links_from_text(line)
+                })
     
+    # Sort by length (longer items are usually more informative) and return top items
+    news_items.sort(key=lambda x: len(x['text']), reverse=True)
+    return news_items[:max_items]
+
+def extract_links_from_text(text: str) -> list:
+    """Extract URLs from text"""
+    import re
+    # Pattern to match URLs
+    url_pattern = r'https?://[^\s\)]+(?=\s|\)|$|,|\.)'
+    links = re.findall(url_pattern, text)
+    return links
+
+def format_news_items(news_items: list, post_title: str, post_link: str) -> str:
+    """Format extracted news items for Telegram"""
+    if not news_items:
+        return f"🤖 **{post_title}**\n\n📰 Check out today's AI news roundup!\n\n🔗 [Read full post]({post_link})"
+    
+    message = f"🤖 **{post_title}**\n\n📰 **Top {len(news_items)} AI News Items:**\n\n"
+    
+    for i, item in enumerate(news_items, 1):
+        # Truncate very long items
+        text = item['text']
+        if len(text) > 200:
+            text = text[:200] + "..."
+        
+        message += f"**{i}.** {text}\n"
+        
+        # Add links if found
+        if item['links']:
+            for link in item['links'][:2]:  # Limit to 2 links per item
+                message += f"   🔗 [Source]({link})\n"
+        
+        message += "\n"
+    
+    message += f"📄 [Read full post with all details]({post_link})"
     return message
 
 def main():
