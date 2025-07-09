@@ -1,0 +1,31 @@
+# .github/workflows/daily-ai-news.yml
+name: Daily AI News to Telegram
+
+on:
+  schedule:
+    # Run at 9 AM UTC every day (adjust timezone as needed)
+    - cron: '0 0 * * *'
+  workflow_dispatch: # Allows manual triggering
+
+jobs:
+  send-news:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+    
+    - name: Install dependencies
+      run: |
+        pip install feedparser requests
+    
+    - name: Run AI News Bot
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+      run: python daily_bot.py
