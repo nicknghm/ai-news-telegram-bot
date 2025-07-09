@@ -119,32 +119,95 @@ def extract_top_news_items(content: str, max_items: int = 5) -> list:
     return news_items[:max_items]
 
 def format_news_items(news_items: list, post_title: str, post_link: str) -> str:
-    """Format extracted news items for Telegram"""
+    """Format extracted news items for Telegram with smart truncation"""
+    
+    # Escape title
+    title = post_title.replace('*', '\\*').replace('_', '\\_').replace('[', '\\[').replace('`', '\\`')
+    
+    # Start building the message
+    header = f"🤖 *{title}*\n\n"
+    footer = f"\n📄 [Read full post]({post_link})"
+    
+    # Calculate available space for content
+    available_space = 3800 - len(header) - len(footer)  # Buffer for safety
+    
     if not news_items:
-        return f"🤖 *{post_title}*\n\n📰 Check out today's AI news roundup!\n\n🔗 [Read full post]({post_link})"
+        content = "📰 Check out today's AI news roundup!"
+        return header + content + footer
     
-    message = f"🤖 *{post_title}*\n\n📰 *Top {len(news_items)} AI News Items:*\n\n"
+    # Build news items section
+    news_header = f"📰 *Top AI News:*\n\n"
+    content = news_header
     
-    for i, item in enumerate(news_items, 1):
-        # Truncate very long items
+    # Calculate space per item (rough estimate)
+    space_per_item = (available_space - len(news_header)) // min(len(news_items), 3)
+    
+    items_added = 0
+    for i, item in enumerate(news_items[:3]):  # Max 3 items
+        # Escape and clean text
         text = item['text']
-        if len(text) > 150:
-            text = text[:150] + "..."
-        
-        # Escape markdown characters in text
         text = text.replace('*', '\\*').replace('_', '\\_').replace('[', '\\[').replace('`', '\\`')
         
-        message += f"*{i}.* {text}\n"
+        # Smart truncation: find good breaking point
+        max_text_length = min(space_per_item - 100, 120)  # Reserve space for formatting and links
         
-        # Add links if found
+        if len(text) > max_text_length:
+            # Try to break at sentence boundary
+            truncated = text[:max_text_length]
+            last_period = truncated.rfind('.')
+            last_comma = truncated.rfind(',')
+            last_space = truncated.rfind(' ')
+            
+            # Choose best break point
+            if last_period > max_text_length - 50:
+                text = text[:last_period + 1]
+            elif last_comma > max_text_length - 30:
+                text = text[:last_comma] + "..."
+            elif last_space > max_text_length - 20:
+                text = text[:last_space] + "..."
+            else:
+                text = text[:max_text_length - 3] + "..."
+        
+        # Format item
+        item_text = f"*{i+1}.* {text}\n"
+        
+        # Add link if available
         if item['links']:
-            for link in item['links'][:1]:  # Limit to 1 link per item
-                message += f"   🔗 [Source]({link})\n"
+            item_text += f"   🔗 [Source]({item['links'][0]})\n"
         
-        message += "\n"
+        item_text += "\n"
+        
+        # Check if adding this item would exceed our space
+        if len(content + item_text) > available_space:
+            if items_added == 0:  # Must include at least one item
+                # Truncate this item more aggressively
+                max_emergency_length = available_space - len(content) - 100
+                if max_emergency_length > 50:
+                    emergency_text = item['text'][:max_emergency_length] + "..."
+                    emergency_text = emergency_text.replace('*', '\\*').replace('_', '\\_').replace('[', '\\[').replace('`', '\\`')
+                    content += f"*1.* {emergency_text}\n\n"
+                    items_added = 1
+            break
+        
+        content += item_text
+        items_added += 1
     
-    message += f"📄 [Read full post with all details]({post_link})"
-    return message
+    # Final message assembly
+    final_message = header + content + footer
+    
+    # Final safety check - if still too long, do emergency truncation
+    if len(final_message) > 3900:
+        # Calculate how much to cut
+        excess = len(final_message) - 3900
+        # Cut from the content, not the header or footer
+        content_end = len(header + content)
+        footer_start = content_end
+        
+        # Truncate content before footer
+        safe_content = content[:-excess-20] + "...\n\n"
+        final_message = header + safe_content + footer
+    
+    return final_message
 
 def format_simple_post(entry) -> str:
     """Simple fallback format for posts"""
@@ -197,12 +260,8 @@ def main():
         
         logger.info(f"Found {len(recent_posts)} recent posts")
         
-        # Send a simple summary first
-        summary = f"📰 *Daily AI News Summary*\n\nProcessing {len(recent_posts)} recent posts..."
-        send_telegram_message(summary)
-        
-        # Process each post
-        for i, post in enumerate(recent_posts[:2]):  # Limit to 2 most recent posts
+        # Send all content in ONE message per post
+        for i, post in enumerate(recent_posts[:1]):  # Limit to 1 most recent post to avoid spam
             try:
                 title = post.get('title', 'AI News Update')
                 link = post.get('link', '')
@@ -211,7 +270,7 @@ def main():
                 logger.info(f"Processing post: {title}")
                 
                 # Try to extract news items
-                news_items = extract_top_news_items(content, max_items=3)
+                news_items = extract_top_news_items(content, max_items=4)
                 
                 if news_items:
                     message = format_news_items(news_items, title, link)
@@ -221,22 +280,20 @@ def main():
                     message = format_simple_post(post)
                     logger.info("Using simple format (no items extracted)")
                 
-                # Send the message
+                # Log message length for debugging
+                logger.info(f"Message length: {len(message)} characters")
+                
+                # Send the single comprehensive message
                 if send_telegram_message(message):
-                    logger.info(f"Successfully sent post {i+1}")
-                    time.sleep(2)  # Rate limiting
+                    logger.info(f"Successfully sent comprehensive update")
                 else:
-                    logger.error(f"Failed to send post {i+1}")
+                    logger.error(f"Failed to send update")
                     
             except Exception as e:
-                logger.error(f"Error processing post {i+1}: {e}")
-                # Try to send a simple error message
-                error_message = f"⚠️ Error processing post: {post.get('title', 'Unknown')}"
+                logger.error(f"Error processing post: {e}")
+                # Send a simple error message
+                error_message = f"⚠️ Error processing today's AI news. Please check [news.smol.ai](https://news.smol.ai) directly."
                 send_telegram_message(error_message)
-        
-        # Send footer
-        footer = "🔔 Daily AI news from [news.smol.ai](https://news.smol.ai)"
-        send_telegram_message(footer)
         
         logger.info("Daily update completed!")
         
